@@ -1,89 +1,109 @@
-"""System audio capture — records PCM from the PipeWire default output monitor.
+"""Speaker capture — records PCM from the application-owned
+Phone_Speaker virtual sink's monitor source.
 
-Uses pw-cat in record mode to capture the default sink's monitor source.
-All pw-cat interaction lives here.
+The capture source is `Phone_Speaker.monitor`, exposed by PipeWire for
+every sink. The user explicitly selects `Phone_Speaker` from
+GNOME Sound → Output Device, so its monitor carries whatever audio
+the user is hearing through the phone call.
+
+The monitor source is, by construction of the underlying
+`module-null-sink`, already in the transport's native format:
+
+    48 kHz
+    stereo
+    Float32 LE
+
+We therefore capture it DIRECTLY in that format and forward the raw
+bytes to AudioSender (UDP). No resampling, no mono->stereo
+duplication, no s16->f32 conversion, no DSP — the speaker path is a
+straight passthrough from the monitor to UDP.
+
+This is the ONLY place where the speaker capture path lives. It is
+intentionally separate from the microphone path (which uses
+MicCapturePipeline to convert from a USB microphone's PCM16 mono
+native format into the transport's float32 stereo 48 kHz format).
+
+Test-tone mode is preserved separately in audio/injector.py and is not
+routed through here.
 """
 from __future__ import annotations
 
+import logging
 import select
 import signal
 import subprocess
 import sys
 import threading
-import time
+
+log = logging.getLogger("audio-bridge")
 
 sys.stdout.reconfigure(line_buffering=True)
 
+# Default capture source — owned by PhoneSpeakerManager
+# (Phone_Speaker.monitor). audio_main.py sets it explicitly via
+# set_capture_source() before start_capture(); this default exists so
+# the standalone demo and tests have a sensible value.
+DEFAULT_CAPTURE_SOURCE = "Phone_Speaker.monitor"
+
+# Transport-format constants — the monitor's native format.
+TRANSPORT_SAMPLE_RATE = 48000
+TRANSPORT_CHANNELS = 2
+_TRANSPORT_FRAME_BYTES = TRANSPORT_CHANNELS * 4  # 2 channels * 4 bytes (f32)
+
 
 class Capture:
-    """Captures PCM bytes from the default PipeWire output monitor.
+    """Captures PCM bytes from the dedicated virtual capture source.
 
-    Exposes start_capture(callback) — callback receives raw PCM bytes.
+    The capture path is a straight passthrough:
+
+        pw-cat (Float32 LE stereo, 48 kHz) -> callback(bytes)
+
+    Exposes start_capture(callback) — callback receives transport-format
+    float32 stereo bytes, ready for the UDP sender.
     """
 
-    def __init__(self):
+    def __init__(self, capture_source: str = DEFAULT_CAPTURE_SOURCE):
         self._proc = None
         self._lock = threading.Lock()
-        self._sample_rate = 48000
-        self._channels = 2
-        self._frame_bytes = 4
+        self._capture_source = capture_source
 
-    # -- device discovery --------------------------------------------------
+    # -- configuration ------------------------------------------------------
 
-    def _get_monitor(self) -> tuple[str, str] | None:
-        """Get (sink_name, monitor_source) for the default output sink.
+    def set_capture_source(self, source_name: str) -> None:
+        """Override the capture source (default: Phone_Speaker.monitor)."""
+        self._capture_source = source_name
 
-        Never selects a virtual microphone monitor.
+    def set_capture_target(self, target: str) -> None:
+        """Override the pw-cat --target argument directly.
+
+        ``target`` is passed verbatim as ``--target`` to pw-cat — it
+        may be either a node name (e.g. ``Phone_Speaker.monitor``) or
+        a numeric Pulse source index (e.g. ``2581``). Use this when
+        the string name does not resolve to a live PipeWire node; the
+        numeric Pulse source index always does.
+
+        This is an additive alternative to ``set_capture_source()``;
+        the existing ``set_capture_source`` API is preserved.
         """
-        # Query all sinks
-        try:
-            result = subprocess.run(
-                ["pactl", "list", "sinks", "short"],
-                capture_output=True, text=True, check=True,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return None
-
-        for line in result.stdout.strip().split("\n"):
-            parts = line.split("\t")
-            if len(parts) >= 2:
-                sink_name = parts[1]
-                # Skip virtual microphones
-                if "mic" in sink_name.lower() or "microphone" in sink_name.lower():
-                    continue
-                monitor = f"{sink_name}.monitor"
-                # Verify monitor exists by trying to query it
-                try:
-                    probe = subprocess.run(
-                        ["pactl", "list", "sources", "short"],
-                        capture_output=True, text=True, check=True,
-                    )
-                    if monitor in probe.stdout:
-                        return sink_name, monitor
-                except (subprocess.CalledProcessError, FileNotFoundError):
-                    pass
-                # If we can't verify, just use it anyway
-                return sink_name, monitor
-
-        return None
+        self._capture_source = target
 
     # -- lifecycle ---------------------------------------------------------
 
     def start_capture(self, callback):
-        """Start capturing audio. callback(bytes) is invoked with each chunk."""
-        monitor_info = self._get_monitor()
-        if monitor_info is None:
-            print("Could not determine default sink monitor")
-            return
-        sink, monitor = monitor_info
-        print(f"Capturing: {monitor}")
+        """Start capturing audio. callback(bytes) is invoked with each
+        transport-format (48 kHz / stereo / Float32 LE) chunk."""
+        monitor = self._capture_source
+        log.debug("Capturing from source: %s", monitor)
 
+        # The monitor source for a module-null-sink is, by construction,
+        # Float32 LE stereo at 48 kHz — the transport format. Capture it
+        # directly with pw-cat; no resampling, no conversion.
         cmd = [
             "pw-cat", "-r",
             "--target", monitor,
             "--format", "f32",
-            "--channels", str(self._channels),
-            "--rate", str(self._sample_rate),
+            "--channels", str(TRANSPORT_CHANNELS),
+            "--rate", str(TRANSPORT_SAMPLE_RATE),
             "-",  # write to stdout
         ]
 
@@ -92,52 +112,30 @@ class Capture:
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
         except FileNotFoundError:
-            print("Error: pw-cat not found. Install pipewire-utils.")
+            log.error("pw-cat not found. Install pipewire-utils.")
             return
 
-        chunk_size = self._sample_rate // 10 * self._channels * self._frame_bytes  # 100ms
+        # Native float32 stereo chunk size: 100ms of stereo audio.
+        # 4 bytes per sample, 2 channels.
+        chunk_frames = TRANSPORT_SAMPLE_RATE // 10  # 100ms in frames
+        chunk_size = chunk_frames * _TRANSPORT_FRAME_BYTES
 
         with self._lock:
             self._proc = proc
-
-        print("------------------------------------")
-        print(f"Device:      {monitor}")
-        print(f"Sample Rate: {self._sample_rate}")
-        print(f"Channels:    {self._channels}")
-        print("------------------------------------\n")
-
-        total_bytes = 0
-        start_time = time.time()
-        last_log_time = start_time
-        frames_per_sec = 0
-        bytes_per_sec = 0
 
         try:
             while True:
                 ready, _, _ = select.select([proc.stdout], [], [], 0.1)
                 if ready:
-                    data = proc.stdout.read(chunk_size)
-                    if not data:
+                    raw = proc.stdout.read(chunk_size)
+                    if not raw:
                         break
-                    total_bytes += len(data)
+                    # Raw bytes are already in transport format —
+                    # forward them directly to the sender.
                     if callback:
-                        callback(data)
-
-                # Log stats every second
-                now = time.time()
-                if now - last_log_time >= 1.0:
-                    if total_bytes > 0:
-                        elapsed = now - last_log_time
-                        bytes_per_sec = total_bytes / elapsed
-                        frames_per_sec = int(bytes_per_sec / (self._channels * self._frame_bytes))
-                        print("------------------------------------")
-                        print(f"Frames/sec: {frames_per_sec}")
-                        print(f"Bytes/sec:  {bytes_per_sec}")
-                        print("------------------------------------\n")
-                    total_bytes = 0
-                    last_log_time = now
+                        callback(raw)
         except KeyboardInterrupt:
-            print("\nStopping...")
+            pass
         finally:
             self._stop(proc)
 
@@ -148,7 +146,6 @@ class Capture:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()
-        print("Stream closed.")
 
     def stop(self):
         """Stop any active capture."""

@@ -5,8 +5,12 @@ never calls pw-cat or subprocess directly.
 """
 from __future__ import annotations
 
+import logging
+
 from audio.capture import Capture
 from audio.injector import Injector
+
+log = logging.getLogger("audio-bridge")
 
 
 class AudioManager:
@@ -32,8 +36,7 @@ class AudioManager:
         if self._callback is not None:
             self.capture.start_capture(self._callback)
         else:
-            # Fallback: capture with no callback (logs raw PCM)
-            print("No capture callback set — capture will not start")
+            log.error("No capture callback set — capture will not start")
         self.injector.start_injection()
 
     def stop(self):
@@ -44,10 +47,12 @@ class AudioManager:
 
 def main():
     """Standalone demo: capture + injection."""
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)-8s %(message)s")
     mgr = AudioManager()
 
     def on_capture(data: bytes):
-        print(f"[captured {len(data)} bytes]", end="")
+        log.info("captured %d bytes", len(data))
 
     mgr.set_capture_callback(on_capture)
     mgr.start()
@@ -57,7 +62,7 @@ def main():
             import time
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        log.info("Shutting down...")
     finally:
         mgr.stop()
 

@@ -5,6 +5,7 @@ All pw-cat interaction lives here.
 """
 from __future__ import annotations
 
+import logging
 import math
 import signal
 import subprocess
@@ -13,6 +14,8 @@ import threading
 import time
 
 import numpy as np
+
+log = logging.getLogger("audio-bridge")
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -61,11 +64,16 @@ class Injector:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def start_injection(self):
-        """Start injecting audio into the virtual microphone."""
+    def start_injection(self, tone: bool = True):
+        """Start injecting audio into the virtual microphone.
+
+        tone: if True, also start the 440 Hz test-tone generator (used for
+              standalone debugging). If False, only open the pw-cat pipe —
+              real PCM is delivered via write_frames() only.
+        """
         target = self._find_virtual_mic()
         if target is None:
-            print("Could not find 'Phone Microphone' sink")
+            log.error("Could not find 'Phone Microphone' sink")
             return
         self._target = target
 
@@ -83,31 +91,22 @@ class Injector:
                 cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
         except FileNotFoundError:
-            print("Error: pw-cat not found. Install pipewire-utils.")
+            log.error("pw-cat not found. Install pipewire-utils.")
             return
 
         with self._lock:
             self._proc = proc
         self._running = True
 
-        print(f"Injecting into: {target}")
-        print(f"Frequency:      {self.freq} Hz")
-        print(f"Sample rate:    {self.sample_rate}")
-        print(f"Channels:       {self.channels}")
-        print("Press Ctrl+C to stop.\n")
-
-        self._tone_thread = threading.Thread(target=self._test_tone_loop, daemon=True)
-        self._tone_thread.start()
+        if tone:
+            log.debug("Test tone active into %s (%.1f Hz, %d Hz, %d ch)",
+                      target, self.freq, self.sample_rate, self.channels)
+            self._tone_thread = threading.Thread(target=self._test_tone_loop, daemon=True)
+            self._tone_thread.start()
 
     def _test_tone_loop(self):
         """Generate and write a continuous test tone. Used for standalone testing."""
         chunk_samples = self.sample_rate // 10
-        frame_bytes = 4
-
-        start_time = time.time()
-        last_log_time = start_time
-        bytes_per_sec = 0
-        frames_per_sec = 0
 
         try:
             while self._running and not self._passthrough:
@@ -125,23 +124,14 @@ class Injector:
                         self._total_bytes_written += len(stereo)
                 self._total_samples += chunk_samples
                 time.sleep(chunk_samples / self.sample_rate)
-
-                # Log stats every second
-                now = time.time()
-                if now - last_log_time >= 1.0:
-                    elapsed = now - last_log_time
-                    bytes_per_sec = self._total_bytes_written / elapsed
-                    frames_per_sec = int(bytes_per_sec / (self.channels * frame_bytes))
-                    print("------------------------------------")
-                    print(f"Frames/sec: {frames_per_sec}")
-                    print(f"Bytes/sec:  {bytes_per_sec}")
-                    print("------------------------------------\n")
-                    self._total_bytes_written = 0
-                    last_log_time = now
         except KeyboardInterrupt:
-            print("\nStopping...")
+            pass
         finally:
-            self.stop()
+            # Just exit the loop. The actual pw-cat lifecycle is owned by
+            # self.stop(), which is meant to be called externally. Calling
+            # it here would tear down the pipe as soon as passthrough mode
+            # is engaged, killing the pipeline.
+            pass
 
     def write_frames(self, data: bytes):
         """Write raw PCM bytes to the injected stream.
@@ -176,7 +166,6 @@ class Injector:
                     proc.wait(timeout=1)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-            print("Stream closed.")
 
 
 if __name__ == "__main__":
