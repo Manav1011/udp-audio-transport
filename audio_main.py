@@ -49,6 +49,7 @@ import signal
 import subprocess
 import sys
 import threading
+from typing import Callable
 
 from audio.audio_manager import AudioManager
 from audio.phone_speaker import PhoneSpeakerManager
@@ -141,9 +142,20 @@ class _SpeakerCaptureController:
         self,
         audio_manager: AudioManager,
         sender_submit,
+        is_connected: Callable[[], bool] | None = None,
     ):
         self._mgr = audio_manager
         self._submit = sender_submit
+        # Optional predicate consulted in start() so the controller
+        # cannot miss an already-connected sender. The sender's state
+        # callback only fires on transitions; if it transitioned to
+        # True before we registered (or while _desired_running was
+        # False) the callback was either never invoked or invoked
+        # and dropped, and no further transition is coming to
+        # retrigger it. ``is_connected`` lets start() close that
+        # race directly. ``audio_main.py`` passes
+        # ``session.sender.is_connected``.
+        self._is_connected = is_connected
         self._lock = threading.Lock()
         self._capture_thread: threading.Thread | None = None
         self._generation = 0
@@ -159,11 +171,16 @@ class _SpeakerCaptureController:
     def start(self) -> None:
         """Begin tracking the sender's connection state.
 
-        We register a state callback; the callback decides whether to
-        start or stop the capture subprocess.
+        Sets ``_desired_running = True`` so future state callbacks
+        are honored, and — if ``is_connected`` was supplied at
+        construction and reports True right now — kicks off capture
+        immediately. This closes the race where the sender connected
+        before the controller was ready.
         """
         with self._lock:
             self._desired_running = True
+        if self._is_connected is not None and self._is_connected():
+            self._start_capture_thread()
 
     def stop(self) -> None:
         """Stop the capture subprocess and refuse to start it again."""
@@ -332,13 +349,31 @@ def main() -> None:
     speaker_controller = _SpeakerCaptureController(
         audio_manager=mgr,
         sender_submit=None,  # wired below
+        # Pass the sender's is_connected() so the controller's
+        # start() can detect the case where the sender already
+        # connected before the controller was ready. The speaker
+        # sender's state callback only fires on transitions; if the
+        # initial connect happened before the callback was registered
+        # (or while _desired_running was False), the callback was
+        # either never invoked or invoked and dropped, and no
+        # transition is coming to retrigger it. Without this, the
+        # very first Android START AUDIO STREAM would wait ~30
+        # seconds for the sender's idle MSG_PEEK probe to time out
+        # before the reconnect actually started capture.
+        is_connected=session.sender.is_connected,
     )
     speaker_controller.install_submit(session.sender.submit)
+    # Register the state callback BEFORE we wait on the sender. If
+    # the sender's daemon thread already connected (Android pressed
+    # START AUDIO STREAM during the few-millisecond window between
+    # sender.start() and now), _notify_state(True) fired with no
+    # listener and was lost. Registering here means we are ready for
+    # the next transition; the is_connected predicate above closes
+    # the gap for the connection that already happened.
     session.sender.add_state_callback(speaker_controller.on_state)
 
     if session.sender.wait_until_connected(timeout=_SPEAKER_CONNECT_TIMEOUT_S):
         log.info("Speaker TCP connected on startup; starting capture")
-        speaker_controller.start()
     else:
         log.warning(
             "Speaker TCP not connected after %.1fs; capture will start "
@@ -346,7 +381,8 @@ def main() -> None:
             "connection",
             _SPEAKER_CONNECT_TIMEOUT_S,
         )
-        speaker_controller.start()
+
+    speaker_controller.start()
 
     log.info("Audio bridge ready")
 
