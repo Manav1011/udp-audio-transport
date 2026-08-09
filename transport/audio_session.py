@@ -1,26 +1,31 @@
-"""AudioSession — wires mic (TCP) and speaker (UDP) end-to-end.
+"""AudioSession — wires mic (TCP) and speaker (TCP) end-to-end.
 
-FINAL ARCHITECTURE:
+FINAL ARCHITECTURE (both transports are TCP):
 
   Microphone:  Android → TCP → AudioTcpMicReceiver → on_pcm callback
                                                → injector.write_frames
 
-  Speaker:     PC capture → AudioSender → UDP → Android speaker
+  Speaker:     PC capture → AudioTcpSpeakerSender → TCP → Android speaker
 
-The receiver is the TCP listener (TCP SERVER). The Android mic app is
-the TCP CLIENT and connects to <backend_ip>:5002.
+The mic receiver is the TCP SERVER. The Android mic app is the TCP
+CLIENT and connects to <backend_ip>:5002.
 
-The sender is the UDP packer (UDP CLIENT). The Android speaker app is
-the UDP receiver/listener.
+The speaker sender is the TCP CLIENT. The backend connects to the
+Android TCP server on SPEAKER_TCP_PORT (default 5000). Both directions
+use a dedicated, full-duplex TCP connection on separate ports; mic
+and speaker are NOT multiplexed onto one TCP connection.
 
 Final-architecture decisions:
   - The TCP mic path is byte-faithful: no framing, no reordering, no
     jitter buffer, no resampling, no DSP. We trust the Android sender
     to produce the agreed PCM format (48000 Hz / stereo / Float32 LE).
-  - The UDP speaker path uses the existing
-    transport.audio_packet.encode_packet wire format and the existing
-    AudioSender that fragments PCM into MAX_PAYLOAD-sized datagrams.
-    This is unchanged.
+  - The TCP speaker path is byte-faithful: PCM bytes are forwarded
+    verbatim via socket.sendall(). No encoding, no compression, no
+    resampling, no framing, no sequence numbers, no UDP-style headers.
+  - The previous speaker-over-UDP path (AudioSender + audio_packet
+    encode_packet) is no longer in the production session. The
+    modules remain in the codebase for tests that still reference
+    them.
   - The previous mic-over-UDP path (AudioReceiver + JitterBuffer +
     silence inserter + sequence recorder + UDP inspector) is no
     longer active in the production session. The modules remain in
@@ -38,14 +43,14 @@ from transport.audio_diagnostic import (
     NullDiagnosticWavWriter,
     is_enabled as diagnostic_is_enabled,
 )
-from transport.audio_sender import AudioSender
 from transport.audio_tcp_mic_receiver import AudioTcpMicReceiver
+from transport.audio_tcp_speaker_sender import AudioTcpSpeakerSender
 
 log = logging.getLogger("audio-bridge")
 
 
 class AudioSession:
-    """Glues an AudioTcpMicReceiver (mic) and an AudioSender (speaker)."""
+    """Glues an AudioTcpMicReceiver (mic) and an AudioTcpSpeakerSender (speaker)."""
 
     def __init__(
         self,
@@ -70,16 +75,20 @@ class AudioSession:
         }
         self._stats_lock = threading.Lock()
 
-        # Speaker = UDP, mic = TCP. The mic receiver's on_pcm callback
+        # Both transports are TCP. The mic receiver's on_pcm callback
         # points at the same internal _deliver_to_injector funnel used
         # by the legacy AudioReceiver path, so the injector contract is
-        # unchanged.
+        # unchanged. The speaker sender is the TCP client to the
+        # Android speaker server.
         self.mic_receiver = AudioTcpMicReceiver(
             on_pcm=self._deliver_to_injector,
             bind_host=mic_bind_host,
             bind_port=mic_bind_port,
         )
-        self.sender = AudioSender(dest=self.speaker_dest)
+        self.sender = AudioTcpSpeakerSender(
+            host=speaker_dest_host,
+            port=speaker_dest_port,
+        )
 
     # -- public API --------------------------------------------------------
 

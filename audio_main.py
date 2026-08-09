@@ -1,6 +1,6 @@
-"""Audio entry point — wires PipeWire audio + dual transport (TCP mic, UDP speaker).
+"""Audio entry point — wires PipeWire audio + dual TCP transport (mic + speaker).
 
-FINAL ARCHITECTURE:
+FINAL ARCHITECTURE (both transports are TCP):
 
     [Android mic] --TCP--> AudioTcpMicReceiver (port 5002)
                                   -> injector.write_frames
@@ -10,11 +10,24 @@ FINAL ARCHITECTURE:
     [Phone_Speaker sink, selected by user from GNOME Sound → Output Device]
         -> Phone_Speaker.monitor
         -> Capture (pw-cat record)
-        -> AudioSender (UDP)
-        -> Android speaker UDP listener (port 5000)
+        -> AudioTcpSpeakerSender (TCP client)
+        -> Android TCP speaker server (port 5000)
 
-The TCP microphone transport is the ONLY mic path. UDP is reserved
-for the speaker path.
+Both transports are TCP. Mic and speaker each have a dedicated TCP
+connection on a separate port — they are NOT multiplexed.
+
+SPEAKER STARTUP CONTRACT — capture must not start before the TCP
+connection is up:
+
+    1. Create the Phone_Speaker virtual device and resolve its monitor
+       Pulse source index.
+    2. Start the AudioTcpSpeakerSender; it begins attempting to connect.
+    3. Wait until the connection is established. Do NOT start pw-cat
+       until this happens.
+    4. Start pw-cat to feed the sender.
+
+    On disconnect: stop pw-cat (no stale PCM is generated). On
+    reconnect: restart pw-cat from the current live monitor.
 
 The application owns and lifecycle-manages three virtual devices:
     Phone_Microphone          (null sink, mic path)
@@ -26,7 +39,7 @@ devices (only those with the `audio-bridge.owned=true` marker), then
 creates fresh ones. On shutdown it removes them in reverse order.
 
 Run:
-    python -m audio_main
+    SPEAKER_TCP_HOST=<phone-ip> python -m audio_main
     # env vars override defaults (see config.py)
 """
 from __future__ import annotations
@@ -43,11 +56,16 @@ from audio.virtual_audio import VirtualAudioManager
 from config import (
     MICROPHONE_TCP_HOST,
     MICROPHONE_TCP_PORT,
-    SPEAKER_UDP_HOST,
-    SPEAKER_UDP_PORT,
+    SPEAKER_TCP_HOST,
+    SPEAKER_TCP_PORT,
 )
 from transport.audio_session import AudioSession
 from utils.logger import log
+
+# How long to wait for the Android TCP speaker server to accept our
+# connection on startup. After this we still proceed (capture will
+# start later on reconnect), but emit a warning.
+_SPEAKER_CONNECT_TIMEOUT_S = 30.0
 
 
 def _get_active_default_sink_name() -> str | None:
@@ -98,6 +116,133 @@ def _get_speaker_sink_id(sink_name: str) -> int | None:
     return None
 
 
+class _SpeakerCaptureController:
+    """Owns the lifecycle of the pw-cat speaker capture subprocess.
+
+    The pw-cat read loop is blocking and runs on its own thread. To
+    "pause" capture we stop the subprocess (the read loop sees EOF
+    and returns); to resume we spawn a new thread. We never queue
+    audio while paused — there is no audio to queue.
+
+    State callbacks from AudioTcpSpeakerSender drive this controller:
+
+        connected=True   -> start_capture_thread()
+        connected=False  -> stop_capture_thread()  (and no more PCM
+                            is generated, so the sender stays idle
+                            until reconnect)
+
+    The controller is single-threaded with respect to its own state:
+    the sender invokes our callbacks on the sender's thread, and we
+    use a lock plus a generation counter to ensure that a stop/start
+    pair never overlaps. Each generation is its own capture thread.
+    """
+
+    def __init__(
+        self,
+        audio_manager: AudioManager,
+        sender_submit,
+    ):
+        self._mgr = audio_manager
+        self._submit = sender_submit
+        self._lock = threading.Lock()
+        self._capture_thread: threading.Thread | None = None
+        self._generation = 0
+        self._desired_running = False
+        self._submit_set = False
+
+    def install_submit(self, submit) -> None:
+        """Wire the sender's submit() into the capture callback. Idempotent."""
+        with self._lock:
+            self._submit = submit
+            self._submit_set = True
+
+    def start(self) -> None:
+        """Begin tracking the sender's connection state.
+
+        We register a state callback; the callback decides whether to
+        start or stop the capture subprocess.
+        """
+        with self._lock:
+            self._desired_running = True
+
+    def stop(self) -> None:
+        """Stop the capture subprocess and refuse to start it again."""
+        with self._lock:
+            self._desired_running = False
+        self._stop_capture_locked()
+
+    def on_state(self, connected: bool) -> None:
+        """Sender state callback. Invoked on the sender thread."""
+        with self._lock:
+            desired = self._desired_running
+        if not desired:
+            return
+        if connected:
+            self._start_capture_thread()
+        else:
+            self._stop_capture_locked()
+
+    # -- internal ---------------------------------------------------------
+
+    def _start_capture_thread(self) -> None:
+        """Start (or no-op if already running) the pw-cat read loop."""
+        with self._lock:
+            existing = self._capture_thread
+            if existing is not None and existing.is_alive():
+                return
+            self._generation += 1
+            gen = self._generation
+            submit = self._submit
+            submit_set = self._submit_set
+
+        if not submit_set or submit is None:
+            log.error(
+                "Speaker capture cannot start: sender submit not wired"
+            )
+            return
+
+        log.info("Speaker capture starting (generation %d)", gen)
+
+        def _run_capture():
+            try:
+                self._mgr.capture.start_capture(submit)
+            except Exception:
+                log.exception(
+                    "Speaker capture thread crashed (generation %d)", gen
+                )
+            finally:
+                # The capture thread is done. If this was the current
+                # generation, clear it; otherwise it's a stale thread
+                # that we replaced.
+                with self._lock:
+                    if self._generation == gen:
+                        self._capture_thread = None
+                log.info("Speaker capture thread exited (generation %d)", gen)
+
+        t = threading.Thread(
+            target=_run_capture,
+            name=f"speaker-capture-{gen}",
+            daemon=True,
+        )
+        with self._lock:
+            self._capture_thread = t
+        t.start()
+
+    def _stop_capture_locked(self) -> None:
+        """Kill the current pw-cat subprocess (read loop returns)."""
+        with self._lock:
+            t = self._capture_thread
+        if t is None:
+            return
+        try:
+            self._mgr.capture.stop()
+        except Exception:
+            log.exception("Speaker capture stop failed")
+        # Don't join — the thread exits on its own when the subprocess
+        # pipe closes (within ~2s of stop()). join() would block the
+        # sender callback thread on shutdown.
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -127,13 +272,6 @@ def main() -> None:
     )
 
     # ---- 3b. Hint if Phone_Speaker is not the active default sink -----
-    # The capture path is correct: pw-cat reads Phone_Speaker.monitor
-    # and the backend sends those bytes to UDP. But the capture only
-    # carries real audio when the user (or GNOME) has set Phone_Speaker
-    # as the system default sink. If it isn't, emit a one-line hint
-    # telling the user exactly what to do. The backend never modifies
-    # the default itself — that's a user decision via GNOME Settings
-    # → Sound → Output Device.
     active_default = _get_active_default_sink_name()
     if active_default is not None and active_default != psm.sink_name():
         sink_id = _get_speaker_sink_id(psm.sink_name())
@@ -158,8 +296,8 @@ def main() -> None:
     session = AudioSession(
         mic_bind_host=MICROPHONE_TCP_HOST,
         mic_bind_port=MICROPHONE_TCP_PORT,
-        speaker_dest_host=SPEAKER_UDP_HOST,
-        speaker_dest_port=SPEAKER_UDP_PORT,
+        speaker_dest_host=SPEAKER_TCP_HOST,
+        speaker_dest_port=SPEAKER_TCP_PORT,
     )
     session.start()
 
@@ -168,42 +306,49 @@ def main() -> None:
         MICROPHONE_TCP_HOST, MICROPHONE_TCP_PORT,
     )
     log.info(
-        "Speaker UDP destination: %s:%d",
-        SPEAKER_UDP_HOST, SPEAKER_UDP_PORT,
+        "Speaker TCP destination: %s:%d",
+        SPEAKER_TCP_HOST, SPEAKER_TCP_PORT,
     )
-    log.info("Speaker capture source: %s", psm.monitor_source_name())
-    log.info("Audio bridge ready")
+
+    # ---- 5. Speaker capture lifecycle -----------------------------------
+    # The TCP sender's start() has already been invoked by
+    # session.start() — it is now attempting to connect on a daemon
+    # thread. We do NOT start pw-cat yet. Instead we wait until the
+    # connection is up, and then start the capture subprocess. On
+    # subsequent disconnect/reconnect we pause and resume capture via
+    # the sender's state callback so we never generate PCM that has
+    # nowhere to go.
+    monitor_index = psm.monitor_source_index()
+    log.info(
+        "Speaker capture monitor: %s (Pulse source index %s)",
+        psm.monitor_source_name(), monitor_index,
+    )
 
     mgr = AudioManager()
-    # The TCP mic receiver -> injector callback is wired via
-    # session.bind_injector(mgr.write_microphone_frames). The speaker
-    # capture path feeds the session's sender submit function.
     session.bind_injector(mgr.write_microphone_frames)
+    mgr.injector.start_injection(tone=False)
+    mgr.capture.set_capture_target(monitor_index)
 
-    def _start_audio():
-        # Open the injector pipe in passthrough mode (tone=False) so no
-        # test tone is generated. write_frames() delivers real PCM from
-        # TCP.
-        mgr.injector.start_injection(tone=False)
-        # Resolve the runtime Pulse source index for Phone_Speaker.monitor.
-        # The string name `Phone_Speaker.monitor` does not resolve to a
-        # live PipeWire node on this system (the pulse-server synthesizes
-        # a proxy over the sink's monitor ports); the numeric Pulse source
-        # index wires up correctly. The index changes between runs, so we
-        # must look it up after Phone_Speaker has been created. If the
-        # monitor is absent, PhoneSpeakerError propagates out of this
-        # daemon thread with the full pactl output in its message.
-        monitor_index = psm.monitor_source_index()
-        log.info(
-            "Speaker capture monitor: %s (Pulse source index %s)",
-            psm.monitor_source_name(), monitor_index,
+    speaker_controller = _SpeakerCaptureController(
+        audio_manager=mgr,
+        sender_submit=None,  # wired below
+    )
+    speaker_controller.install_submit(session.sender.submit)
+    session.sender.add_state_callback(speaker_controller.on_state)
+
+    if session.sender.wait_until_connected(timeout=_SPEAKER_CONNECT_TIMEOUT_S):
+        log.info("Speaker TCP connected on startup; starting capture")
+        speaker_controller.start()
+    else:
+        log.warning(
+            "Speaker TCP not connected after %.1fs; capture will start "
+            "automatically when the Android speaker server accepts the "
+            "connection",
+            _SPEAKER_CONNECT_TIMEOUT_S,
         )
-        mgr.capture.set_capture_target(monitor_index)
-        mgr.set_capture_callback(session.sender.submit)
-        mgr.capture.start_capture(mgr._callback)
+        speaker_controller.start()
 
-    audio_thread = threading.Thread(target=_start_audio, daemon=True)
-    audio_thread.start()
+    log.info("Audio bridge ready")
 
     shutdown = {"done": False}
 
@@ -212,7 +357,11 @@ def main() -> None:
             return
         shutdown["done"] = True
         log.info("Shutting down...")
-        # Reverse order: network -> audio -> speaker device -> mic devices.
+        # Reverse order: capture -> network -> speaker device -> mic devices.
+        try:
+            speaker_controller.stop()
+        except Exception:
+            log.exception("Failed to stop speaker capture")
         try:
             session.stop()
         except Exception:

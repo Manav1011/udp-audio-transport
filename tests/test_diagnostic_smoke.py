@@ -146,6 +146,18 @@ def test_diagnostic_tee_records_exact_bytes_via_session(tmp_path):
     mic_port = free.getsockname()[1]
     free.close()
 
+    # Reserve a separate, closed port for the speaker sender. It must
+    # NOT be the same as mic_port — if the sender connects to mic_port
+    # the receiver's accept loop accepts that connection and then blocks
+    # in recv() while the sender stays idle, starving the test's real
+    # mic client of an accept. With the speaker pointed at a port that
+    # nobody is listening on, its background connect loop keeps retrying
+    # harmlessly and never ties up the mic listener.
+    dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    dead.bind(("127.0.0.1", 0))
+    speaker_port = dead.getsockname()[1]
+    dead.close()
+
     def fake_injector_write(pcm: bytes):
         injector_write_calls.append(pcm)
 
@@ -154,7 +166,7 @@ def test_diagnostic_tee_records_exact_bytes_via_session(tmp_path):
         mic_bind_host="127.0.0.1",
         mic_bind_port=mic_port,
         speaker_dest_host="127.0.0.1",
-        speaker_dest_port=mic_port,  # unused for this test; speaker is a no-op here
+        speaker_dest_port=speaker_port,  # closed; sender keeps retrying
     )
     session.bind_injector(fake_injector_write)
     session.start()
